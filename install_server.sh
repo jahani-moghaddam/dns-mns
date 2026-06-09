@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # --- Settings (override via environment) -------------------------------------
-REPO_URL="${REPO_URL:-https://github.com/yourname/PersianUltraDNS.git}"
+REPO_URL="${REPO_URL:-https://github.com/jahani-moghaddam/dns-mns.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/persianultradns}"
 SERVICE_NAME="${SERVICE_NAME:-pud-server}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0:53}"
@@ -28,6 +28,18 @@ die()   { echo "${c_red}[x]${c_reset} $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "Please run as root (sudo bash install_server.sh)."
 
 # --- Collect the tunnel domain(s) --------------------------------------------
+# Guard: if stdin is not a terminal (piped from curl), print instructions and exit.
+if [ ! -t 0 ]; then
+  echo
+  echo "ERROR: This script must be run directly, not piped from curl."
+  echo
+  echo "  Please download it first, then run it:"
+  echo "    curl -fsSL https://raw.githubusercontent.com/jahani-moghaddam/dns-mns/master/install_server.sh -o install_server.sh"
+  echo "    sudo bash install_server.sh"
+  echo
+  exit 1
+fi
+
 echo
 echo "Enter your delegated tunnel domain(s)."
 echo "  - One or more, comma- or space-separated (e.g. v.example.com, v2.example.net)."
@@ -35,11 +47,11 @@ echo "  - Each must have an NS record delegating it to this server's A record."
 read -r -p "Domain(s): " DOMAIN_INPUT
 [ -n "${DOMAIN_INPUT// /}" ] || die "At least one domain is required."
 
-# Normalise into a TOML array: ["a", "b"]
+# Normalise into a TOML array: ["a", "b"]  — pure bash, no xargs
 DOMAINS_TOML="["
 first=1
 for d in $(echo "$DOMAIN_INPUT" | tr ',' ' '); do
-  d="$(echo "$d" | xargs)"   # trim
+  d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"  # trim whitespace
   [ -z "$d" ] && continue
   if [ $first -eq 1 ]; then first=0; else DOMAINS_TOML+=", "; fi
   DOMAINS_TOML+="\"$d\""

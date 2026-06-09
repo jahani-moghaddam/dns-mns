@@ -74,6 +74,7 @@ Now every query for `*.v.example.com` reaches your server. (Tip: keep the domain
 #### 2. Server (on your Linux VPS)
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/jahani-moghaddam/dns-mns/master/install_server.sh -o install_server.sh
 sudo bash install_server.sh
 ```
 
@@ -86,10 +87,17 @@ sudo ufw allow 53/udp
 #### 3. Client (on your machine)
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/jahani-moghaddam/dns-mns/master/build_client.sh -o build_client.sh
 bash build_client.sh
 ```
 
-It builds the client and asks for your **domain(s)**, the **key** from step 2, and your **resolvers**. Then run it:
+Or clone and run:
+
+```bash
+git clone https://github.com/jahani-moghaddam/dns-mns.git
+cd dns-mns
+bash build_client.sh
+```
 
 ```bash
 ./target/release/pud-client --config client_config.toml

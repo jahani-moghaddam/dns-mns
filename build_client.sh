@@ -10,7 +10,7 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/yourname/PersianUltraDNS.git}"
+REPO_URL="${REPO_URL:-https://github.com/jahani-moghaddam/dns-mns.git}"
 SOCKS_LISTEN="${SOCKS_LISTEN:-127.0.0.1:18080}"
 HTTP_LISTEN="${HTTP_LISTEN:-127.0.0.1:18081}"
 MAX_RESPONSE="${MAX_RESPONSE:-1232}"
