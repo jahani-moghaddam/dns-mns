@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Local secrets / generated keys (never commit these)
+pud_key.hex
+encrypt_key.txt
+*.key
+
+# Local configs (ship the .toml.simple / templates instead)
+client_config.toml
+server_config.toml
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
