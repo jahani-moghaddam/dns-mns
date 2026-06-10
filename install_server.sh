@@ -190,6 +190,20 @@ systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 systemctl restart "$SERVICE_NAME"
 sleep 2
 
+# --- Install 'pud' management command ----------------------------------------
+info "Installing 'pud' management command..."
+PUD_SCRIPT_SRC="$SRC_DIR/pud.sh"
+if [ -f "$PUD_SCRIPT_SRC" ]; then
+  cp "$PUD_SCRIPT_SRC" /usr/local/bin/pud
+else
+  # Download standalone if not present in the repo
+  curl -fsSL "https://raw.githubusercontent.com/jahani-moghaddam/dns-mns/master/pud.sh" \
+       -o /usr/local/bin/pud 2>/dev/null || \
+  warn "Could not install pud management script — copy pud.sh to /usr/local/bin/pud manually."
+fi
+chmod +x /usr/local/bin/pud 2>/dev/null || true
+ok "Type 'pud' at any time to manage the server."
+
 # --- Verify + report ---------------------------------------------------------
 echo
 if systemctl is-active --quiet "$SERVICE_NAME" && ss -lunp 2>/dev/null | grep -q ':53 '; then
@@ -215,6 +229,9 @@ echo "  Service   : systemctl status $SERVICE_NAME"
 echo
 echo "  ${c_yellow}PRE-SHARED KEY (give this to the client):${c_reset}"
 echo "  ${c_cyan}$KEY_HEX${c_reset}"
+echo
+echo "  Management: type ${c_cyan}pud${c_reset} for the interactive menu"
+echo "              (start / stop / restart / update / show key / uninstall)"
 echo
 echo "  Reminder — DNS records required:"
 echo "    A   ns.<domain>   -> <this server's public IP>   (DNS only / not proxied)"

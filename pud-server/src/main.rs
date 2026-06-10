@@ -168,12 +168,22 @@ async fn handle_datagram(ctx: &Ctx, datagram: Vec<u8>, peer: std::net::SocketAdd
             } else if let Ok((_h, pt)) = open_frame(&ctx.crypto, Direction::ClientToServer, &frame) {
                 (true, pt)
             } else {
+                tracing::debug!(
+                    "session 0x{:08x}: decrypt failed (counter={})",
+                    header.session_id,
+                    header.counter
+                );
                 return;
             }
         } else if let Ok((_h, pt)) = open_frame(&ctx.crypto, Direction::ClientToServer, &frame) {
             (true, pt)
         } else {
-            return; // bad key / tampered / not ours
+            tracing::debug!(
+                "session 0x{:08x}: decrypt failed (counter={})",
+                header.session_id,
+                header.counter
+            );
+            return;
         }
     };
 
@@ -184,10 +194,21 @@ async fn handle_datagram(ctx: &Ctx, datagram: Vec<u8>, peer: std::net::SocketAdd
     // immediate responses (e.g. a ProbeAck or ServerHello) come back so we can
     // deliver them in THIS response.
     let mut inline: Vec<DownlinkMsg> = Vec::new();
-    if session.accept_counter(header.counter as u64) {
+    let mut log_exchange = false;
+    let mut uplink_summary = "none".to_string();
+    let replay_ok = session.accept_counter(header.counter as u64);
+    if replay_ok {
         if let Ok(msgs) = decode_uplink(&plaintext) {
+            log_exchange = should_log_uplink(&msgs);
+            uplink_summary = summarize_uplink(&msgs);
             inline = process_uplink(ctx, &session, header.session_id, msgs).await;
         }
+    } else {
+        tracing::debug!(
+            "session 0x{:08x}: replay rejected counter={}",
+            header.session_id,
+            header.counter
+        );
     }
 
     // Build the downlink response within the negotiated budget. The budget is
@@ -197,6 +218,7 @@ async fn handle_datagram(ctx: &Ctx, datagram: Vec<u8>, peer: std::net::SocketAdd
     let inline_reserve: usize = inline.iter().map(downlink_wire_size).sum();
     let budget = plaintext_budget(max_resp, query.question.name.len());
     let mut down_msgs = session.build_downlink(budget.saturating_sub(inline_reserve), &ctx.policy);
+    let has_inline = !inline.is_empty();
     down_msgs.extend(inline);
     let down_plain = encode_downlink(&down_msgs);
 
@@ -221,6 +243,18 @@ async fn handle_datagram(ctx: &Ctx, datagram: Vec<u8>, peer: std::net::SocketAdd
 
     match dns::build_txt_response(&datagram, &resp_frame) {
         Ok(resp) => {
+            if log_exchange || should_log_downlink(&down_msgs, has_inline) {
+                tracing::debug!(
+                    "reply peer={peer} session=0x{:08x} up_ctr={} psk={} replay_ok={} uplink={} downlink={} resp_bytes={}",
+                    header.session_id,
+                    header.counter,
+                    used_psk,
+                    replay_ok,
+                    uplink_summary,
+                    summarize_downlink(&down_msgs),
+                    resp.len()
+                );
+            }
             if let Err(e) = ctx.socket.send_to(&resp, peer).await {
                 tracing::debug!("send_to {peer} failed: {e}");
             }
@@ -240,6 +274,7 @@ async fn process_uplink(
         match msg {
             UplinkMsg::Hello { max_resp } => {
                 session.set_client_max_resp(max_resp);
+                tracing::debug!("session 0x{session_id:08x}: Hello max_resp={max_resp}");
                 let _ = PROTOCOL_VERSION;
             }
             UplinkMsg::Open {
@@ -248,8 +283,11 @@ async fn process_uplink(
                 port,
             } => {
                 let (stream, created) = session.get_or_create_stream(stream_id);
+                let host = addr_to_host(&addr);
+                tracing::debug!(
+                    "session 0x{session_id:08x}: Open stream={stream_id} {host}:{port} created={created}"
+                );
                 if created {
-                    let host = addr_to_host(&addr);
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     stream.set_sender(tx);
                     spawn_egress(
@@ -259,7 +297,6 @@ async fn process_uplink(
                         Duration::from_secs(ctx.cfg.connect_timeout_secs),
                         rx,
                     );
-                    let _ = (&addr,);
                 }
             }
             UplinkMsg::Data {
@@ -267,16 +304,26 @@ async fn process_uplink(
                 offset,
                 payload,
             } => {
+                tracing::debug!(
+                    "session 0x{session_id:08x}: Data stream={stream_id} offset={offset} len={}",
+                    payload.len()
+                );
                 if let Some(stream) = session.get_stream(stream_id) {
                     stream.handle_uplink_data(offset, &payload);
+                } else {
+                    tracing::debug!(
+                        "session 0x{session_id:08x}: Data for unknown stream={stream_id}"
+                    );
                 }
             }
             UplinkMsg::Close { stream_id } => {
+                tracing::debug!("session 0x{session_id:08x}: Close stream={stream_id}");
                 if let Some(stream) = session.get_stream(stream_id) {
                     stream.close_uplink();
                 }
             }
             UplinkMsg::Reset { stream_id } => {
+                tracing::debug!("session 0x{session_id:08x}: Reset stream={stream_id}");
                 // Client aborted the stream; stop feeding the target and drop it.
                 if let Some(stream) = session.get_stream(stream_id) {
                     stream.close_uplink();
@@ -284,6 +331,9 @@ async fn process_uplink(
                 session.remove_stream(stream_id);
             }
             UplinkMsg::Ack { stream_id, up_to } => {
+                tracing::debug!(
+                    "session 0x{session_id:08x}: Ack stream={stream_id} up_to={up_to}"
+                );
                 if let Some(stream) = session.get_stream(stream_id) {
                     stream.ack_downlink(up_to);
                 }
@@ -301,6 +351,7 @@ async fn process_uplink(
                 inline.push(DownlinkMsg::ProbeAck { nonce, data });
             }
             UplinkMsg::ClientHello { eph_pub } => {
+                tracing::debug!("session 0x{session_id:08x}: ClientHello (handshake)");
                 // Forward-secret key exchange: derive per-session data keys and
                 // reply with our ephemeral public key (inline, same response).
                 let server_pub = session.establish(&ctx.key, eph_pub, session_id);
@@ -310,6 +361,78 @@ async fn process_uplink(
         }
     }
     inline
+}
+
+fn should_log_uplink(msgs: &[UplinkMsg]) -> bool {
+    msgs.iter()
+        .any(|m| !matches!(m, UplinkMsg::Poll | UplinkMsg::Loss { .. }))
+}
+
+fn should_log_downlink(msgs: &[DownlinkMsg], has_inline: bool) -> bool {
+    has_inline
+        || msgs.iter().any(|m| {
+            !matches!(
+                m,
+                DownlinkMsg::Welcome | DownlinkMsg::UpAck { .. } | DownlinkMsg::ProbeAck { .. }
+            )
+        })
+}
+
+fn summarize_uplink(msgs: &[UplinkMsg]) -> String {
+    if msgs.is_empty() {
+        return "none".into();
+    }
+    let mut parts = Vec::new();
+    for msg in msgs {
+        match msg {
+            UplinkMsg::Hello { max_resp } => parts.push(format!("Hello({max_resp})")),
+            UplinkMsg::Open { stream_id, addr, port } => {
+                parts.push(format!("Open({stream_id},{addr:?}:{port})"));
+            }
+            UplinkMsg::Data { stream_id, offset, payload } => {
+                parts.push(format!("Data({stream_id},{offset},{}b)", payload.len()));
+            }
+            UplinkMsg::Close { stream_id } => parts.push(format!("Close({stream_id})")),
+            UplinkMsg::Ack { stream_id, up_to } => {
+                parts.push(format!("Ack({stream_id},{up_to})"));
+            }
+            UplinkMsg::Poll => parts.push("Poll".into()),
+            UplinkMsg::Loss { permille } => parts.push(format!("Loss({permille})")),
+            UplinkMsg::Probe { want, .. } => parts.push(format!("Probe(want={want})")),
+            UplinkMsg::Reset { stream_id } => parts.push(format!("Reset({stream_id})")),
+            UplinkMsg::ClientHello { .. } => parts.push("ClientHello".into()),
+        }
+    }
+    parts.join(",")
+}
+
+fn summarize_downlink(msgs: &[DownlinkMsg]) -> String {
+    if msgs.is_empty() {
+        return "none".into();
+    }
+    let mut parts = Vec::new();
+    for msg in msgs {
+        match msg {
+            DownlinkMsg::Welcome => parts.push("Welcome".into()),
+            DownlinkMsg::OpenResult { stream_id, status } => {
+                parts.push(format!("OpenResult({stream_id},{status})"));
+            }
+            DownlinkMsg::UpAck { stream_id, up_to } => {
+                parts.push(format!("UpAck({stream_id},{up_to})"));
+            }
+            DownlinkMsg::Closed { stream_id } => parts.push(format!("Closed({stream_id})")),
+            DownlinkMsg::Shard(s) => {
+                parts.push(format!(
+                    "Shard({},{},{})",
+                    s.stream_id, s.block_seq, s.shard.len()
+                ));
+            }
+            DownlinkMsg::ProbeAck { data, .. } => parts.push(format!("ProbeAck({}b)", data.len())),
+            DownlinkMsg::Reset { stream_id } => parts.push(format!("Reset({stream_id})")),
+            DownlinkMsg::ServerHello { .. } => parts.push("ServerHello".into()),
+        }
+    }
+    parts.join(",")
 }
 
 /// Wire size of a downlink message that may be appended inline to a response.

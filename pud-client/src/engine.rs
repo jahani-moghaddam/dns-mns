@@ -534,18 +534,26 @@ impl EngineInner {
                 let mut up = s.up.lock();
                 up.maybe_rewind(self.rto);
                 let room = budget.saturating_sub(used);
-                let chunk_cap = self.max_uplink_chunk.min(room.saturating_sub(7));
+                // A Data message costs its payload plus a fixed header of
+                // tag(1)+stream_id(2)+offset(4)+len-prefix(2) = 9 bytes. Reserve
+                // exactly that, or the chunk would be sized to overflow the
+                // budget and be dropped by `push` *after* `take` already
+                // advanced the send cursor — silently losing those bytes.
+                let chunk_cap = self
+                    .max_uplink_chunk
+                    .min(room.saturating_sub(DATA_HEADER_OVERHEAD));
                 if chunk_cap > 0 {
                     if let Some((offset, payload)) = up.take(chunk_cap) {
-                        let _ = push(
-                            UplinkMsg::Data {
-                                stream_id: s.stream_id,
-                                offset,
-                                payload,
-                            },
-                            &mut out,
-                            &mut used,
-                        );
+                        let msg = UplinkMsg::Data {
+                            stream_id: s.stream_id,
+                            offset,
+                            payload,
+                        };
+                        if !push(msg, &mut out, &mut used) {
+                            // Did not fit after all: roll the send cursor back
+                            // so these bytes are retried, never dropped.
+                            up.cursor = offset;
+                        }
                     }
                 }
 
@@ -1360,6 +1368,11 @@ fn apply_response(engine: &Arc<EngineInner>, resp: &[u8]) -> bool {
     engine.process_downlink(msgs);
     had
 }
+
+/// Fixed wire overhead of an uplink `Data` message, excluding its payload:
+/// tag(1) + stream_id(2) + offset(4) + length-prefix(2). Used to size uplink
+/// chunks so an encoded `Data` message never overflows the per-query budget.
+const DATA_HEADER_OVERHEAD: usize = 1 + 2 + 4 + 2;
 
 /// Encoded wire size of an uplink message (matches the protocol codec).
 fn uplink_size(msg: &UplinkMsg) -> usize {

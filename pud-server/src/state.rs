@@ -535,8 +535,16 @@ fn refill_blocks(stream: &Arc<Stream>, data_shards: u16, parity: u16) {
         let have = d.raw.len();
         let take = if have >= block_data {
             block_data
-        } else if d.target_eof && have > 0 {
-            have // flush the tail at EOF
+        } else if have > 0 {
+            // Flush whatever is buffered immediately. The server is poll-driven
+            // and most real traffic (HTTP/1.1 keep-alive, TLS, interactive
+            // protocols) keeps the connection open and sends responses smaller
+            // than a full block, so we must not wait for the buffer to fill or
+            // the target to close — that would stall every such stream forever.
+            // Bursty/bulk transfers still coalesce naturally: raw fills between
+            // builds, so under load `have >= block_data` and we encode full
+            // blocks anyway.
+            have
         } else {
             break;
         };

@@ -21,17 +21,18 @@ pub fn spawn_egress(
     mut rx: UnboundedReceiver<Vec<u8>>,
 ) {
     tokio::spawn(async move {
+        let stream_id = stream.stream_id;
         let addr = format!("{host}:{port}");
         let connect = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr)).await;
         let tcp = match connect {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                tracing::debug!(target: "egress", "connect to {addr} failed: {e}");
+                tracing::debug!("egress stream {stream_id}: connect to {addr} failed: {e}");
                 stream.set_state(OpenState::Failed);
                 return;
             }
             Err(_) => {
-                tracing::debug!(target: "egress", "connect to {addr} timed out");
+                tracing::debug!("egress stream {stream_id}: connect to {addr} timed out");
                 stream.set_state(OpenState::Failed);
                 return;
             }
@@ -39,31 +40,47 @@ pub fn spawn_egress(
         let _ = tcp.set_nodelay(true);
         let (mut rd, mut wr) = tcp.into_split();
         stream.set_state(OpenState::Open);
+        tracing::debug!("egress stream {stream_id}: connected to {addr}");
 
         // Writer task: drain the uplink channel into the socket.
+        let writer_addr = addr.clone();
         let writer = tokio::spawn(async move {
+            let mut written = 0usize;
             while let Some(buf) = rx.recv().await {
+                let n = buf.len();
                 if wr.write_all(&buf).await.is_err() {
                     break;
                 }
+                written += n;
             }
             let _ = wr.shutdown().await;
+            tracing::debug!(
+                "egress stream {stream_id}: wrote {written} bytes to {writer_addr}"
+            );
         });
 
         // Reader loop: target -> downlink buffer.
         let mut buf = vec![0u8; 16 * 1024];
         let mut errored = false;
+        let mut read_total = 0usize;
         loop {
             match rd.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => stream.push_downlink(&buf[..n]),
+                Ok(n) => {
+                    read_total += n;
+                    tracing::debug!("egress stream {stream_id}: read {n} bytes from {addr}");
+                    stream.push_downlink(&buf[..n]);
+                }
                 Err(e) => {
-                    tracing::debug!(target: "egress", "read from {addr} error: {e}");
+                    tracing::debug!("egress stream {stream_id}: read from {addr} error: {e}");
                     errored = true;
                     break;
                 }
             }
         }
+        tracing::debug!(
+            "egress stream {stream_id}: {addr} finished read_total={read_total} errored={errored}"
+        );
         if errored {
             // Abnormal failure: tell the client to tear down promptly rather
             // than waiting for data that will never arrive.
